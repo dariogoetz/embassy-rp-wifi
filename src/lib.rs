@@ -17,7 +17,7 @@ embassy_rp::bind_interrupts!(struct Irqs {
 
 #[macro_export]
 macro_rules! define_webserver_task {
-    ($app:ident, $AppRouter:ty, $State:ty) => {
+    ($AppRouter:ty, $State:ty) => {
         #[embassy_executor::task]
         async fn webserver_task(
             spawner: embassy_executor::Spawner,
