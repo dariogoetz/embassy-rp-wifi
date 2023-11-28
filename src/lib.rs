@@ -5,12 +5,12 @@ use defmt::{info, warn, Debug2Format};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIN_29, PIO0};
 use embassy_rp::pio::Pio;
+use embassy_time::Timer;
 use rand::Rng;
 use static_cell::make_static;
 
-pub const WEB_TASK_POOL_SIZE: usize = 8;
-
 // need one more socket for DHCP
+pub const WEB_TASK_POOL_SIZE: usize = 8;
 const N_SOCKETS: usize = WEB_TASK_POOL_SIZE + 1;
 
 embassy_rp::bind_interrupts!(struct Irqs {
@@ -25,6 +25,8 @@ pub async fn start_wifi(
     p_dio: PIN_24,
     p_clk: PIN_29,
     p_dma: DMA_CH0,
+    wifi_ssid: &str,
+    wifi_pass: &str,
 ) -> (
     &'static embassy_net::Stack<cyw43::NetDriver<'static>>,
     cyw43::Control<'static>,
@@ -66,9 +68,79 @@ pub async fn start_wifi(
 
     let stack = make_static!(stack);
     spawner.must_spawn(net_task(stack));
-    info!("Net stack ok");
+    // info!("Net stack ok");
+
+    // info!("Join WIFI {}...", wifi_ssid);
+    while let Err(e) = control.join_wpa2(wifi_ssid, wifi_pass).await {
+        warn!("Could not join WIFI {}: {}", wifi_ssid, Debug2Format(&e));
+    }
+    // info!("WIFI connected");
+
+    // Wait for DHCP, not necessary when using static IP
+    // info!("Waiting for DHCP...");
+    while !stack.is_config_up() {
+        Timer::after_millis(100).await;
+    }
 
     (stack, control)
+}
+
+pub struct EmbassyTimer;
+
+impl picoserve::Timer for EmbassyTimer {
+    type Duration = embassy_time::Duration;
+    type TimeoutError = embassy_time::TimeoutError;
+
+    async fn run_with_timeout<F: core::future::Future>(
+        &mut self,
+        duration: Self::Duration,
+        future: F,
+    ) -> Result<F::Output, Self::TimeoutError> {
+        embassy_time::with_timeout(duration, future).await
+    }
+}
+
+#[macro_export]
+macro_rules! picoserve_task {
+    ($AppRouter:ty, $State:ty) => {
+        #[embassy_executor::task]
+        async fn picoserve_task(
+            id: usize,
+            stack: &'static embassy_net::Stack<cyw43::NetDriver<'static>>,
+            app: &'static picoserve::Router<$AppRouter, $State>,
+            config: &'static picoserve::Config<Duration>,
+            state: $State,
+        ) {
+            let mut rx_buffer = [0; 1024];
+            let mut tx_buffer = [0; 1024];
+
+            loop {
+                let mut socket =
+                    embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+
+                if let Err(e) = socket.accept(80).await {
+                    warn!("{}: accept error: {:?}", id, e);
+                    continue;
+                }
+
+                let (socket_rx, socket_tx) = socket.split();
+
+                if let Err(err) = picoserve::serve_with_state(
+                    app,
+                    embassy_rp_wifi::EmbassyTimer,
+                    config,
+                    &mut [0; 2048],
+                    socket_rx,
+                    socket_tx,
+                    &state,
+                )
+                .await
+                {
+                    defmt::error!("{}", Debug2Format(&err));
+                }
+            }
+        }
+    };
 }
 
 #[embassy_executor::task]
