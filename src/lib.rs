@@ -18,7 +18,7 @@ embassy_rp::bind_interrupts!(struct Irqs {
 
 #[macro_export]
 macro_rules! define_webserver_task {
-    ($app:ident, $config:ident, $AppRouter:ty, $State:ty) => {
+    ($app:ident, $AppRouter:ty, $State:ty) => {
         #[embassy_executor::task]
         async fn webserver_task(
             spawner: embassy_executor::Spawner,
@@ -31,7 +31,6 @@ macro_rules! define_webserver_task {
             wifi_ssid: &'static str,
             wifi_pass: &'static str,
             app: &'static picoserve::Router<$AppRouter, $State>,
-            config: &'static picoserve::Config<Duration>,
             state: $State,
         ) {
             let (stack, mut control) =
@@ -56,6 +55,10 @@ macro_rules! define_webserver_task {
             while !stack.is_config_up() {
                 embassy_time::Timer::after_millis(100).await;
             }
+            let config = make_static!(picoserve::Config {
+                start_read_request_timeout: Some(Duration::from_secs(5)),
+                read_request_timeout: Some(Duration::from_secs(1)),
+            });
 
             for id in 0..embassy_rp_wifi::WEB_TASK_POOL_SIZE {
                 spawner.must_spawn(picoserve_task(id, stack, app, config, state.clone()));
