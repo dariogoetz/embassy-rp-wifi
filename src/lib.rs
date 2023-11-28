@@ -1,7 +1,6 @@
 #![no_std]
 #![feature(type_alias_impl_trait)]
 
-use defmt::info;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIN_29, PIO0};
 use embassy_rp::pio::Pio;
@@ -38,9 +37,7 @@ macro_rules! define_webserver_task {
 
             let stack = make_static!(stack);
             spawner.must_spawn(embassy_rp_wifi::net_task(stack));
-            // info!("Net stack ok");
 
-            // info!("Join WIFI {}...", wifi_ssid);
             while let Err(e) = control.join_wpa2(wifi_ssid, wifi_pass).await {
                 defmt::warn!(
                     "Could not join WIFI {}: {}",
@@ -48,10 +45,8 @@ macro_rules! define_webserver_task {
                     defmt::Debug2Format(&e)
                 );
             }
-            // info!("WIFI connected");
 
             // Wait for DHCP, not necessary when using static IP
-            // info!("Waiting for DHCP...");
             while !stack.is_config_up() {
                 embassy_time::Timer::after_millis(100).await;
             }
@@ -119,7 +114,6 @@ pub async fn start_wifi(
     cyw43::Control<'static>,
 ) {
     // start WIFI
-    info!("Initialize net stack...");
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
 
     // To make flashing faster for development, you may want to flash the firmwares independently
