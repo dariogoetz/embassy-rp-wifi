@@ -1,11 +1,10 @@
 #![no_std]
 #![feature(type_alias_impl_trait)]
 
-use defmt::{info, warn, Debug2Format};
+use defmt::info;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIN_29, PIO0};
 use embassy_rp::pio::Pio;
-use embassy_time::Timer;
 use rand::Rng;
 use static_cell::make_static;
 
@@ -17,6 +16,92 @@ embassy_rp::bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
 });
 
+#[macro_export]
+macro_rules! define_webserver_task {
+    ($app:ident, $config:ident, $AppRouter:ty, $State:ty) => {
+        #[embassy_executor::task]
+        async fn webserver_task(
+            spawner: embassy_executor::Spawner,
+            p_pwr: embassy_rp::peripherals::PIN_23,
+            p_cs: embassy_rp::peripherals::PIN_25,
+            p_pio: embassy_rp::peripherals::PIO0,
+            p_dio: embassy_rp::peripherals::PIN_24,
+            p_clk: embassy_rp::peripherals::PIN_29,
+            p_dma: embassy_rp::peripherals::DMA_CH0,
+            wifi_ssid: &'static str,
+            wifi_pass: &'static str,
+            app: &'static picoserve::Router<$AppRouter, $State>,
+            config: &'static picoserve::Config<Duration>,
+            state: $State,
+        ) {
+            let (stack, mut control) =
+                embassy_rp_wifi::start_wifi(spawner, p_pwr, p_cs, p_pio, p_dio, p_clk, p_dma).await;
+
+            let stack = make_static!(stack);
+            spawner.must_spawn(embassy_rp_wifi::net_task(stack));
+            // info!("Net stack ok");
+
+            // info!("Join WIFI {}...", wifi_ssid);
+            while let Err(e) = control.join_wpa2(wifi_ssid, wifi_pass).await {
+                defmt::warn!(
+                    "Could not join WIFI {}: {}",
+                    wifi_ssid,
+                    defmt::Debug2Format(&e)
+                );
+            }
+            // info!("WIFI connected");
+
+            // Wait for DHCP, not necessary when using static IP
+            // info!("Waiting for DHCP...");
+            while !stack.is_config_up() {
+                embassy_time::Timer::after_millis(100).await;
+            }
+
+            for id in 0..embassy_rp_wifi::WEB_TASK_POOL_SIZE {
+                spawner.must_spawn(picoserve_task(id, stack, app, config, state.clone()));
+            }
+        }
+
+        #[embassy_executor::task]
+        async fn picoserve_task(
+            id: usize,
+            stack: &'static embassy_net::Stack<cyw43::NetDriver<'static>>,
+            app: &'static picoserve::Router<$AppRouter, $State>,
+            config: &'static picoserve::Config<Duration>,
+            state: $State,
+        ) {
+            let mut rx_buffer = [0; 1024];
+            let mut tx_buffer = [0; 1024];
+
+            loop {
+                let mut socket =
+                    embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+
+                if let Err(e) = socket.accept(80).await {
+                    defmt::warn!("{}: accept error: {:?}", id, e);
+                    continue;
+                }
+
+                let (socket_rx, socket_tx) = socket.split();
+
+                if let Err(err) = picoserve::serve_with_state(
+                    app,
+                    embassy_rp_wifi::EmbassyTimer,
+                    config,
+                    &mut [0; 2048],
+                    socket_rx,
+                    socket_tx,
+                    &state,
+                )
+                .await
+                {
+                    defmt::error!("{}", defmt::Debug2Format(&err));
+                }
+            }
+        }
+    };
+}
+
 pub async fn start_wifi(
     spawner: embassy_executor::Spawner,
     p_pwr: PIN_23,
@@ -25,10 +110,9 @@ pub async fn start_wifi(
     p_dio: PIN_24,
     p_clk: PIN_29,
     p_dma: DMA_CH0,
-    wifi_ssid: &str,
-    wifi_pass: &str,
+    // shared_data: MutexSharedData,
 ) -> (
-    &'static embassy_net::Stack<cyw43::NetDriver<'static>>,
+    embassy_net::Stack<cyw43::NetDriver<'static>>,
     cyw43::Control<'static>,
 ) {
     // start WIFI
@@ -66,22 +150,6 @@ pub async fn start_wifi(
     // let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
     control.init(clm).await;
 
-    let stack = make_static!(stack);
-    spawner.must_spawn(net_task(stack));
-    // info!("Net stack ok");
-
-    // info!("Join WIFI {}...", wifi_ssid);
-    while let Err(e) = control.join_wpa2(wifi_ssid, wifi_pass).await {
-        warn!("Could not join WIFI {}: {}", wifi_ssid, Debug2Format(&e));
-    }
-    // info!("WIFI connected");
-
-    // Wait for DHCP, not necessary when using static IP
-    // info!("Waiting for DHCP...");
-    while !stack.is_config_up() {
-        Timer::after_millis(100).await;
-    }
-
     (stack, control)
 }
 
@@ -98,49 +166,6 @@ impl picoserve::Timer for EmbassyTimer {
     ) -> Result<F::Output, Self::TimeoutError> {
         embassy_time::with_timeout(duration, future).await
     }
-}
-
-#[macro_export]
-macro_rules! picoserve_task {
-    ($AppRouter:ty, $State:ty) => {
-        #[embassy_executor::task]
-        async fn picoserve_task(
-            id: usize,
-            stack: &'static embassy_net::Stack<cyw43::NetDriver<'static>>,
-            app: &'static picoserve::Router<$AppRouter, $State>,
-            config: &'static picoserve::Config<Duration>,
-            state: $State,
-        ) {
-            let mut rx_buffer = [0; 1024];
-            let mut tx_buffer = [0; 1024];
-
-            loop {
-                let mut socket =
-                    embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-                if let Err(e) = socket.accept(80).await {
-                    warn!("{}: accept error: {:?}", id, e);
-                    continue;
-                }
-
-                let (socket_rx, socket_tx) = socket.split();
-
-                if let Err(err) = picoserve::serve_with_state(
-                    app,
-                    embassy_rp_wifi::EmbassyTimer,
-                    config,
-                    &mut [0; 2048],
-                    socket_rx,
-                    socket_tx,
-                    &state,
-                )
-                .await
-                {
-                    defmt::error!("{}", Debug2Format(&err));
-                }
-            }
-        }
-    };
 }
 
 #[embassy_executor::task]
